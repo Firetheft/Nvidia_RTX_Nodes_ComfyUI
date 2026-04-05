@@ -128,11 +128,10 @@ class CompressionMode(str, Enum):
     COMPACT = "compact"
 
 
-class UpscaleTypedDict(TypedDict):
+class UpscaleTypedDict(TypedDict, total=False):
     resize_type: UpscaleType
     scale: float
-    width: int
-    height: int
+    resolution: str
 
 
 QUALITY_MAPPING = {
@@ -146,16 +145,19 @@ QUALITY_MAPPING = {
 def _resolve_output_dimensions(width: int, height: int, resize_type: UpscaleTypedDict) -> tuple[int, int]:
     selected_type = resize_type["resize_type"]
     if selected_type == UpscaleType.SCALE_BY:
-        scale = resize_type["scale"]
-        output_width = int(width * scale)
-        output_height = int(height * scale)
+        scale = resize_type.get("scale", 2.0)
     elif selected_type == UpscaleType.TARGET_DIMENSIONS:
-        output_width = resize_type["width"]
-        output_height = resize_type["height"]
+        try:
+            target_longest_side = int(resize_type["resolution"].split("(")[1].replace(")", ""))
+            longest_side = max(width, height)
+            scale = target_longest_side / longest_side
+        except Exception:
+            scale = 1.0
     else:
         raise ValueError(f"Unsupported resize type: {selected_type}")
-    output_width = max(8, round(output_width / 8) * 8)
-    output_height = max(8, round(output_height / 8) * 8)
+        
+    output_width = max(8, int(round((width * scale) / 8.0)) * 8)
+    output_height = max(8, int(round((height * scale) / 8.0)) * 8)
     return output_width, output_height
 
 
@@ -787,12 +789,19 @@ class RTXVideoSuperResolution(io.ComfyNode):
                             io.Float.Input("scale", default=2.0, min=1.0, max=4.0, step=0.01, tooltip="Scale factor (e.g., 2.0 doubles the size)."),
                         ]),
                         io.DynamicCombo.Option(UpscaleType.TARGET_DIMENSIONS, [
-                            io.Int.Input("width", default=1920, min=64, max=8192, step=8, tooltip="Target width in pixels."),
-                            io.Int.Input("height", default=1080, min=64, max=8192, step=8, tooltip="Target height in pixels.")
+                            io.Combo.Input("resolution", options=["720p (1280)", "1080p (1920)", "2k (2560)", "3k (3072)", "4k (3840)", "8k (7680)"], default="1080p (1920)", tooltip="Target fixed resolution (longest side).")
                         ])
                     ],
                 ),
                 io.Combo.Input("quality", options=["LOW", "MEDIUM", "HIGH", "ULTRA"], default="ULTRA"),
+                io.Int.Input(
+                    "max_megapixels",
+                    default=16,
+                    min=1,
+                    max=1024,
+                    step=1,
+                    tooltip="Maximum pixel budget (MP). The system automatically calculates batch sizes based on this value. For 8GB VRAM, 16-32 is recommended. Higher values speed up processing but consume more VRAM.",
+                ),
             ],
             outputs=[
                 io.Image.Output("upscaled_images"),
@@ -800,10 +809,10 @@ class RTXVideoSuperResolution(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images: torch.Tensor, resize_type: UpscaleTypedDict, quality: str) -> io.NodeOutput:
+    def execute(cls, images: torch.Tensor, resize_type: UpscaleTypedDict, quality: str, max_megapixels: int = 16) -> io.NodeOutput:
         _, height, width, _ = images.shape
         output_width, output_height = _resolve_output_dimensions(width, height, resize_type)
-        batch_size = _get_frame_batch_size(output_width, output_height, 1024 * 1024 * 16)
+        batch_size = _get_frame_batch_size(output_width, output_height, int(max_megapixels * 1024 * 1024))
         selected_quality = _get_selected_quality(quality)
         with nvvfx.VideoSuperRes(selected_quality) as sr:
             sr.output_width = output_width
@@ -840,8 +849,7 @@ class RTXVideoSuperResolutionChunked(io.ComfyNode):
                             io.Float.Input("scale", default=2.0, min=1.0, max=4.0, step=0.01, tooltip="Scale factor (e.g., 2.0 doubles the size)."),
                         ]),
                         io.DynamicCombo.Option(UpscaleType.TARGET_DIMENSIONS, [
-                            io.Int.Input("width", default=1920, min=64, max=8192, step=8, tooltip="Target width in pixels."),
-                            io.Int.Input("height", default=1080, min=64, max=8192, step=8, tooltip="Target height in pixels."),
+                            io.Combo.Input("resolution", options=["720p (1280)", "1080p (1920)", "2k (2560)", "3k (3072)", "4k (3840)", "8k (7680)"], default="1080p (1920)", tooltip="Target fixed resolution (longest side).")
                         ]),
                     ],
                 ),
@@ -861,12 +869,12 @@ class RTXVideoSuperResolutionChunked(io.ComfyNode):
                     tooltip="Frames decoded and processed per segment. Lower values use less memory, higher values improve throughput.",
                 ),
                 io.Int.Input(
-                    "max_pixels_per_batch",
-                    default=1024 * 1024 * 16,
-                    min=1024 * 1024,
-                    max=1024 * 1024 * 256,
-                    step=1024 * 1024,
-                    tooltip="Upper bound for total output pixels processed on the GPU at once.",
+                    "max_megapixels",
+                    default=16,
+                    min=1,
+                    max=1024,
+                    step=1,
+                    tooltip="Maximum pixel budget (MP). The system automatically calculates batches based on this value. For 8GB VRAM, 16-32 is recommended. Higher values mean faster processing but consume more VRAM.",
                 ),
                 io.Combo.Input(
                     "encoder",
@@ -902,7 +910,7 @@ class RTXVideoSuperResolutionChunked(io.ComfyNode):
         quality: str,
         cache_backend: str,
         chunk_frames: int,
-        max_pixels_per_batch: int,
+        max_megapixels: int,
         encoder: str,
         writer: str,
         compression: str,
@@ -916,7 +924,7 @@ class RTXVideoSuperResolutionChunked(io.ComfyNode):
             quality=quality,
             cache_backend=cache_backend,
             chunk_frames=chunk_frames,
-            max_pixels_per_batch=max_pixels_per_batch,
+            max_pixels_per_batch=int(max_megapixels * 1024 * 1024),
             compression=compression,
             fps=fps,
             encoder=encoder,
@@ -949,8 +957,7 @@ class RTXVideoSuperResolutionChunkedImageSequence(io.ComfyNode):
                             io.Float.Input("scale", default=2.0, min=1.0, max=4.0, step=0.01, tooltip="Scale factor (e.g., 2.0 doubles the size)."),
                         ]),
                         io.DynamicCombo.Option(UpscaleType.TARGET_DIMENSIONS, [
-                            io.Int.Input("width", default=1920, min=64, max=8192, step=8, tooltip="Target width in pixels."),
-                            io.Int.Input("height", default=1080, min=64, max=8192, step=8, tooltip="Target height in pixels."),
+                            io.Combo.Input("resolution", options=["720p (1280)", "1080p (1920)", "2k (2560)", "3k (3072)", "4k (3840)", "8k (7680)"], default="1080p (1920)", tooltip="Target fixed resolution (longest side).")
                         ]),
                     ],
                 ),
@@ -970,12 +977,12 @@ class RTXVideoSuperResolutionChunkedImageSequence(io.ComfyNode):
                     tooltip="Frames decoded and processed per segment. Lower values use less memory during upscaling.",
                 ),
                 io.Int.Input(
-                    "max_pixels_per_batch",
-                    default=1024 * 1024 * 16,
-                    min=1024 * 1024,
-                    max=1024 * 1024 * 256,
-                    step=1024 * 1024,
-                    tooltip="Upper bound for total output pixels processed on the GPU at once.",
+                    "max_megapixels",
+                    default=16,
+                    min=1,
+                    max=1024,
+                    step=1,
+                    tooltip="Maximum pixel budget (MP). The system automatically calculates the batch based on this value. 8G video memory is recommended to be 16-32. The larger the value, the faster the speed but takes up more video memory.",
                 ),
                 io.Combo.Input(
                     "encoder",
@@ -1013,7 +1020,7 @@ class RTXVideoSuperResolutionChunkedImageSequence(io.ComfyNode):
         quality: str,
         cache_backend: str,
         chunk_frames: int,
-        max_pixels_per_batch: int,
+        max_megapixels: int,
         encoder: str,
         writer: str,
         compression: str,
@@ -1027,7 +1034,7 @@ class RTXVideoSuperResolutionChunkedImageSequence(io.ComfyNode):
             quality=quality,
             cache_backend=cache_backend,
             chunk_frames=chunk_frames,
-            max_pixels_per_batch=max_pixels_per_batch,
+            max_pixels_per_batch=int(max_megapixels * 1024 * 1024),
             compression=compression,
             fps=fps,
             encoder=encoder,
